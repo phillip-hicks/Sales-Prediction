@@ -1,0 +1,1033 @@
+---
+
+
+```{r}
+library(xgboost)
+library(tidyverse)
+library(data.table)
+library(caret)
+library(stringr)
+library(missForest)
+library(e1071)
+library(pROC)
+library(randomForest)
+library(ggplot2)
+library(RPostgreSQL)
+
+opdata_new <- dbGetQuery(con,
+"select salesforce_opportunity_id, salesforce_opportunity_stage_name, salesforce_account_company_type, time_from_2017, salesforce_op_annual_construction_volume, salesforce_account_billing_latitude, salesforce_account_billing_longitude, salesforce_account_market_served_limited, salesforce_opportunity_zuora_amount,manager_of_opportunity_owner_id,  salesforce_account_id, task_count, salesforce_opportunity_competitor , filled_forms,moments, opened_emails,date_difference,trial
+from
+(
+WITH salesforce_user AS (select salesforce.user.*, salesforce.user_role.name as user_role
+        from  salesforce.user
+        left join salesforce.user_role
+        on salesforce.user.user_role_id =  salesforce.user_role.id )
+  ,  is_pipe_won_sql AS (SELECT bat_id as bizible_attribution_id,
+       TRUE AS is_pipe,
+      CASE WHEN stage_name = 'Closed Won' THEN TRUE
+           ELSE FALSE
+       END AS is_won from
+  (SELECT bat.id AS bat_id, opp.id AS opp_id, stage_name, bat.bizible_2_touchpoint_date_c,bat.bizible_2_touchpoint_position_c, row_number() over (partition BY opp.id
+                                                                                                                                                              ORDER BY bat.bizible_2_touchpoint_date_c) AS num
+   FROM salesforce._account acct
+   JOIN salesforce.bizible_2_bizible_attribution_touchpoint_c bat ON bizible_2_account_c = acct.id
+   JOIN salesforce.opportunity opp ON bat.bizible_2_opportunity_c = opp.id
+   WHERE opp.type IN ('New Annual Access', 'New Multi-Year Annual Access', 'Convert Pilot to Multi-Year Annual', 'Convert Pilot Project to Annual Access')
+     AND opp.stage_name IN ('2 - Discovery', '3 - Evaluation', '4 - Proposal/ROI', '5 - Negotiations', '6 - Final Contract Out For Signature', 'Deal Review', 'Closed Won', 'Closed Lost')
+   )
+WHERE num = 1
+ )
+  ,  bizible_attribution_touchpoint AS (select *
+    from salesforce.bizible_2_bizible_attribution_touchpoint_c bat
+    left join is_pipe_won_sql is_pipe_won
+    on bat.id = is_pipe_won.bizible_attribution_id
+    left join looker_scratch_prod_base_connection.LR$L9SPCVJI3RR37QAUBHRZD_bat_eligibility bat_eligibility
+    on bat.id = bat_eligibility.bat_id
+    )
+SELECT 
+    CASE
+WHEN salesforce_account.company_type_3_c='General Contractor'  THEN '0' 
+WHEN salesforce_account.company_type_3_c='Subcontractor'  THEN '1' 
+WHEN salesforce_account.company_type_3_c in ('Owner','Real Estate Developer')  THEN '2' 
+ELSE '3' 
+END AS salesforce_account_company_type__sort_,
+    mapping__segmented_accounts.sort_order  AS mapping__segmented_accounts_sort_order,
+    salesforce_opportunity.id  AS salesforce_opportunity_id,
+    salesforce_opportunity.account_id  AS salesforce_opportunity_account_id,
+    salesforce_opportunity.stage_name  AS salesforce_opportunity_stage_name,
+    salesforce_opportunity.annual_construction_volume_cap_c  AS salesforce_op_annual_construction_volume,
+    salesforce_account.billing_latitude  AS salesforce_account_billing_latitude,
+    CASE
+WHEN salesforce_account.company_type_3_c='General Contractor'  THEN 'General Contractor' 
+WHEN salesforce_account.company_type_3_c='Subcontractor'  THEN 'Subcontractor' 
+WHEN salesforce_account.company_type_3_c in ('Owner','Real Estate Developer')  THEN 'Owner / Real Estate Developer' 
+ELSE 'Other' 
+END AS salesforce_account_company_type,
+    salesforce_account.billing_longitude  AS salesforce_account_billing_longitude,
+    CASE WHEN salesforce_account.market_served_3_c in ('Commercial and Institutional',
+                                        'Education',
+                                        'Healthcare',
+                                        'Retail')
+          THEN 'Commercial/Non-Residential'
+          WHEN salesforce_account.market_served_3_c in ('Multifamily',
+                                    'Single Family')
+          THEN 'Residential'
+          ELSE 'Infrastructure'
+          END
+           AS salesforce_account_market_served_limited,
+    mapping__segmented_accounts.segment  AS mapping__segmented_accounts_segment,
+    DATE(case when (DATE(salesforce_opportunity.pipeline_creation_by_stage_c )) >= '2016-07-01' then (DATE(salesforce_opportunity.pipeline_creation_by_stage_c ))
+        when (salesforce_opportunity.stage_name in (
+          '2 - Discovery',
+          '3 - Evaluation',
+          '4 - Proposal/ROI',
+          '5 - Negotiations',
+          '6 - Final Contract Out For Signature',
+          'Deal Review',
+          'Closed Won',
+          'Closed Lost')
+          and (DATE(salesforce_opportunity.pipeline_creation_time_c )) is not null)
+          then cast((DATE(salesforce_opportunity.pipeline_creation_time_c )) as date) else (DATE(salesforce_opportunity.pipeline_creation_by_stage_c )) end) AS salesforce_opportunity_true_pipeline_creation_date,
+    salesforce_opportunity.zuora_amount_c  AS salesforce_opportunity_zuora_amount,
+    manager_of_opportunity_owner.id  AS manager_of_opportunity_owner_id,
+        
+            date(salesforce_opportunity_true_pipeline_creation_date) - date('2017-01-01') as time_from_2017,
+    salesforce_account.id  AS salesforce_account_id,
+    count(case when salesforce_task.type is not NULL and    DATE(salesforce_task.created_date ) < DATE(salesforce_opportunity.pipeline_creation_time_c ) then 1 else null end) over(partition by salesforce_opportunity_id)as task_count,
+    salesforce_opportunity.competitor_c  AS salesforce_opportunity_competitor,
+    sum( marketo_agg_by_date_lead_rollup_activites.distinct_fill_out_form)over(partition by salesforce_opportunity_id)  as filled_forms,
+    sum( marketo_agg_by_date_lead_rollup_activites.distinct_interesting_moment) over(partition by salesforce_opportunity_id)as moments,
+    sum( marketo_agg_by_date_lead_rollup_activites.distinct_open_email ) over(partition by salesforce_opportunity_id) as opened_emails, 
+    
+    DATE(salesforce_opportunity.pipeline_creation_time_c ) - DATE(salesforce_opportunity.created_date ) as date_difference,
+ 
+  salesforce_opportunity.demo_access_c as trial
+ 
+ 
+FROM salesforce.account  AS salesforce_account
+LEFT JOIN looker_scratch_prod_base_connection.LR$L9DBKW7K6ZYHXAL3AMIOH_mapping__segmented_accounts AS mapping__segmented_accounts ON salesforce_account.id = mapping__segmented_accounts.account_id
+        
+LEFT JOIN salesforce.opportunity  AS salesforce_opportunity ON salesforce_opportunity.account_id = salesforce_account.id
+LEFT JOIN salesforce_user AS opportunity_owner ON salesforce_opportunity.owner_id = opportunity_owner.id 
+INNER JOIN salesforce_user AS manager_of_opportunity_owner ON manager_of_opportunity_owner.id = opportunity_owner.manager_id 
+Left Join salesforce.task as salesforce_task on salesforce_task.opportunity_c = salesforce_opportunity.id
+left join salesforce.contact as salesforce_contact on salesforce_contact.account_id = salesforce_account.id
+left join marketo.lead as marketo_lead on marketo_lead.sfdc_contact_id = salesforce_contact.id
+Left join marketo.agg_by_date_lead_rollup_activities as marketo_agg_by_date_lead_rollup_activites on  marketo_agg_by_date_lead_rollup_activites.lead_id = marketo_lead.id 
+INNER JOIN bizible_attribution_touchpoint AS bizible_attribution_touchpoints ON bizible_attribution_touchpoints.bizible_2_opportunity_c = salesforce_opportunity.id
+      and bizible_attribution_touchpoints.is_deleted = false
+WHERE 
+ 
+(DATE(salesforce_task.created_date ) < DATE(salesforce_opportunity.pipeline_creation_time_c ) +  interval '15 days') and (date(salesforce_opportunity_true_pipeline_creation_date) > date(bizible_attribution_touchpoints.bizible_2_touchpoint_date_c)) and  date(marketo_agg_by_date_lead_rollup_activites.activity_date) < DATE(salesforce_opportunity.pipeline_creation_time_c  )+15 and salesforce_opportunity_competitor is not null and (mapping__segmented_accounts.segment ILIKE 'Emerging' OR mapping__segmented_accounts.segment ILIKE 'Mid Market' OR mapping__segmented_accounts.segment ILIKE 'Strategic Mid' OR mapping__segmented_accounts.segment ILIKE 'Enterprise') AND (mapping__segmented_accounts.segment_type ILIKE 'Revenue Line') AND ( salesforce_opportunity.stage_name ILIKE 'Closed Won' or salesforce_opportunity.stage_name ILIKE 'Closed Lost') AND (salesforce_opportunity.type ILIKE 'New Annual Access' OR salesforce_opportunity.type ILIKE 'New Multi-Year Annual Access') AND ((case when (DATE(salesforce_opportunity.pipeline_creation_by_stage_c )) >= '2016-07-01' then (DATE(salesforce_opportunity.pipeline_creation_by_stage_c ))
+        when (salesforce_opportunity.stage_name in (
+          '2 - Discovery',
+          '3 - Evaluation',
+          '4 - Proposal/ROI',
+          '5 - Negotiations',
+          '6 - Final Contract Out For Signature',
+          'Deal Review',
+          'Closed Won',
+          'Closed Lost')
+          and (DATE(salesforce_opportunity.pipeline_creation_time_c )) is not null)
+          then cast((DATE(salesforce_opportunity.pipeline_creation_time_c )) as date) else (DATE(salesforce_opportunity.pipeline_creation_by_stage_c )) end >= TIMESTAMP '2017-01-01')) AND (bizible_attribution_touchpoints.bizible_2_touchpoint_date_c  IS NOT NULL)  and  (salesforce_opportunity.is_deleted = false and salesforce_account.is_deleted = false)
+GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,salesforce_task.type,salesforce_account_id,salesforce_task.call_duration_in_seconds,salesforce_opportunity_competitor,marketo_agg_by_date_lead_rollup_activites.distinct_fill_out_form, marketo_agg_by_date_lead_rollup_activites.distinct_interesting_moment, marketo_agg_by_date_lead_rollup_activites.distinct_open_email, marketo_agg_by_date_lead_rollup_activites.distinct_visit_webpage,salesforce_opportunity.pipeline_creation_time_c, salesforce_opportunity.created_date,trial,salesforce_task.created_date,marketo_agg_by_date_lead_rollup_activites.activity_date
+)
+group by salesforce_opportunity_id, salesforce_opportunity_stage_name, salesforce_account_company_type, time_from_2017, salesforce_op_annual_construction_volume, salesforce_op_annual_construction_volume, salesforce_account_billing_longitude, salesforce_account_billing_latitude, salesforce_account_market_served_limited,salesforce_opportunity_zuora_amount,manager_of_opportunity_owner_id ,  salesforce_account_id, task_count,salesforce_opportunity_competitor, filled_forms,moments, opened_emails,date_difference,trial
+order by random()
+"
+)
+
+
+opdata <- opdata_new
+
+opdata <- opdata%>%
+  select (-(salesforce_account_id))
+opdata <- opdata%>%
+  select (-(salesforce_opportunity_id))
+#Pulls in data and removes op and account id fields
+
+```
+
+
+
+
+```{r}
+
+
+opdata_clean<-opdata
+
+
+opdata_clean  <- opdata_clean %>%
+    mutate_all(funs(str_replace_all( . , "/", "")))
+opdata_clean  <- opdata_clean %>%
+    mutate_all(funs(str_replace_all( . , " ", "")))
+opdata_clean  <- opdata_clean %>%
+    mutate_all(funs(str_replace_all( . , "-", "")))
+#removes unusual characters from fields
+
+
+trial <- opdata_clean %>%
+  select(trial) %>%
+  magrittr::equals("Completed")
+opdata_clean$time_from_2017 <- as.numeric(opdata_clean$time_from_2017)
+trial <-lapply(trial, is.na)
+trial <- lapply(trial, as.numeric)
+trial <- as.numeric(trial)
+#Changes trial field from Completed and Null to 1 and 0
+```
+
+
+
+```{r}
+
+opdata_clean <- opdata_clean %>%
+  select (-(trial))
+#removes old trial field with strings
+
+
+```
+
+
+
+
+
+
+
+```{r}
+
+opdata_numeric <- cbind(opdata_clean,trial)
+opdata_numeric = na.omit(opdata_numeric)
+#adds new trial column to data frame and removes null data frame testing
+
+win<- opdata_numeric %>%
+  select(salesforce_opportunity_stage_name) %>%
+  magrittr::equals("ClosedWon")
+#Changes Closed Won and Closed Lost to 1s and 0s
+
+opdata_numeric<- opdata_numeric %>%
+  select (-(salesforce_opportunity_stage_name))
+#Removes old Closed Won and Closed Lost Field
+
+numberOfTrainingSamples <- round(length(opdata_clean$time_from_2017) * .8)
+win <-as.numeric(win)
+opdata_numeric <- cbind(opdata_numeric,win)
+train_data_frame<-(opdata_numeric[1:numberOfTrainingSamples,])
+test_data_frame <- (opdata_numeric[-(1:numberOfTrainingSamples),])
+
+#Splits data into 80% training data and 20% testing data
+
+
+```
+
+
+
+
+
+```{r}
+train_data_frame$date_difference <- as.double(train_data_frame$date_difference)
+train_data_frame$task_count <- as.numeric(train_data_frame$task_count)
+train_data_frame$filled_forms <- as.double(train_data_frame$filled_forms)
+train_data_frame$moments <- as.double(train_data_frame$moments)
+train_data_frame$opened_emails <- as.double(train_data_frame$opened_emails)
+train_data_frame$salesforce_opportunity_zuora_amount <- as.double(train_data_frame$salesforce_opportunity_zuora_amount)
+train_data_frame$salesforce_account_billing_longitude <- as.double(train_data_frame$salesforce_account_billing_longitude)
+train_data_frame$salesforce_account_billing_latitude <- as.double(train_data_frame$salesforce_account_billing_latitude)
+train_data_frame$salesforce_op_annual_construction_volume <- as.double(train_data_frame$salesforce_op_annual_construction_volume)
+train_data_frame <- train_data_frame %>%
+  select (-(manager_of_opportunity_owner_id))
+train_data_frame <- train_data_frame %>%
+  select (-(salesforce_opportunity_competitor))
+#makes all the data into nice doubles since for some reason it comes in as chars and removes old columns 
+
+```
+
+
+
+```{r}
+
+train_data_frame$win <- as.factor(train_data_frame$win)
+train_data_frame=train_data_frame %>% mutate_if(is.character, as.factor)
+varNames<- names(train_data_frame)
+varNames <- varNames[!varNames %in% c("win")]
+varNames1 <- paste(varNames, collapse = "+")
+rf.form <- as.formula(paste("win", varNames1, sep = " ~ "))
+#does more stuff to make the data more acceptable for Random Forest
+train_data_frame<-train_data_frame[,sort(names(train_data_frame))]
+#orders columns alphabetically so the order matches the incoming data later on
+model_rf<-randomForest(rf.form, train_data_frame, ntree=5, importance = T, na.action = na.omit, n_estimators = 10, max_features = 6, min_samples_leaf = 3, nfolds = 3)
+#creates the model
+predRFtrain<- predict(model_rf, train_data_frame)
+
+#finds training accuracy
+
+```
+
+
+```{r}
+# test_data_frame$first_15_days_call <- as.double(test_data_frame$first_15_days_call)
+
+test_data_frame$date_difference <- as.double(test_data_frame$date_difference)
+test_data_frame$task_count <- as.numeric(test_data_frame$task_count)
+test_data_frame$filled_forms <- as.double(test_data_frame$filled_forms)
+test_data_frame$moments <- as.double(test_data_frame$moments)
+test_data_frame$opened_emails <- as.double(test_data_frame$opened_emails)
+test_data_frame$salesforce_opportunity_zuora_amount <- as.double(test_data_frame$salesforce_opportunity_zuora_amount)
+test_data_frame$salesforce_account_billing_longitude <- as.double(test_data_frame$salesforce_account_billing_longitude)
+test_data_frame$salesforce_account_billing_latitude <- as.double(test_data_frame$salesforce_account_billing_latitude)
+test_data_frame$salesforce_op_annual_construction_volume <- as.double(test_data_frame$salesforce_op_annual_construction_volume)
+test_data_frame <- test_data_frame %>%
+  select (-(manager_of_opportunity_owner_id))
+test_data_frame <- test_data_frame %>%
+  select (-(salesforce_opportunity_competitor))
+#makes all the data into nice doubles since for some reason it comes in as chars and removes old columns
+
+test_data_frame$win <- as.factor(test_data_frame$win)
+test_data_frame=test_data_frame %>% mutate_if(is.character, as.factor)
+test_data_frame<-test_data_frame[,sort(names(test_data_frame))]
+#orders columns alphabetically so the order matches the incoming data later on
+i<- 1
+err_final <- 1
+model_rf_final <- 1
+while (i<=300){
+  model_rf<-randomForest(rf.form, train_data_frame, ntree=13, importance = T, na.action = na.omit, n_estimators = 4, min_samples_leaf = 5)
+  predRFtest <- predict(model_rf, test_data_frame)
+  err<- mean(predRFtest!= test_data_frame$win)
+
+  i<-i+1
+  if(err < err_final){
+    err_final<-err
+    model_rf_final <- model_rf
+  }
+}
+
+predRFtest <- predict(model_rf_final, test_data_frame)
+
+ err<- mean(predRFtest!= test_data_frame$win)
+print(paste("test-error=", err))
+#uses model to predict on test data, since random forest is random, it need a loop to find the best model
+confusionMatrix(data = predRFtest, reference = test_data_frame$win)
+
+#provides results
+```
+
+
+
+
+```{r}
+opdata <- opdata_new
+
+opdata <- opdata%>%
+  select (-(salesforce_account_id))
+opdata <- opdata%>%
+  select (-(salesforce_opportunity_id))
+#brings in uncleaned data again to be used on the other two models
+```
+
+```{r}
+
+
+opdata_clean<-opdata
+
+colnumb <- which( colnames(opdata_clean)=="salesforce_account_market_served_limited" )
+
+opdata_clean  <- opdata_clean %>%
+    mutate_all(funs(str_replace_all( . , "/", "")))
+opdata_clean  <- opdata_clean %>%
+    mutate_all(funs(str_replace_all( . , " ", "")))
+opdata_clean  <- opdata_clean %>%
+    mutate_all(funs(str_replace_all( . , "-", "")))
+#Cleans up bad characters
+competitor <- model.matrix(~salesforce_opportunity_competitor-1, opdata_clean)
+owner_id <- model.matrix(~manager_of_opportunity_owner_id-1, opdata_clean)
+company_type <- model.matrix(~salesforce_account_company_type-1, opdata_clean)
+market <- model.matrix(~salesforce_account_market_served_limited-1, opdata_clean)
+#As XGBoost only accepts doubles, char columns are made into matrices where each option is a column with either a 1 or a 0
+trial <- opdata_clean %>%
+  select(trial) %>%
+  magrittr::equals("Completed")
+#Makes the trial field binary
+opdata_clean$time_from_2017 <- as.numeric(opdata_clean$time_from_2017)
+trial <-lapply(trial, is.na)
+trial <- lapply(trial, as.numeric)
+trial <- as.numeric(trial)
+```
+
+
+
+```{r}
+opdata_clean <- opdata_clean %>%
+  select(-(salesforce_opportunity_competitor))
+opdata_clean <- opdata_clean %>%
+  select (-(trial))
+opdata_clean <- opdata_clean %>%
+  select(-(manager_of_opportunity_owner_id))
+opdata_clean <- opdata_clean %>%
+  select (-(salesforce_account_company_type))
+opdata_clean <- opdata_clean %>%
+  select (-(salesforce_account_market_served_limited))
+#removes old fields
+
+```
+
+
+
+
+
+
+
+```{r}
+opdata_numeric <- cbind(opdata_clean,trial,competitor, market, owner_id, company_type)
+opdata_numeric = na.omit(opdata_numeric)
+#combines new matrices with rest of data, removes nulls
+win<- opdata_numeric %>%
+  select(salesforce_opportunity_stage_name) %>%
+  magrittr::equals("ClosedWon")
+#Makes win binary
+opdata_numeric<- opdata_numeric %>%
+  select (-(salesforce_opportunity_stage_name))
+#removes old columns
+opdata_numeric<-opdata_numeric[,sort(names(opdata_numeric))]
+#orders columns so they're the same as incoming data
+numberOfTrainingSamples <- round(length(opdata_clean$time_from_2017) * .8)
+#finds 80/20 split in data
+win <-as.numeric(win)
+
+
+
+
+```
+
+
+
+
+```{r}
+
+opdata_matrix <- data.matrix(opdata_numeric)
+
+train_data <-as.matrix(opdata_matrix[1:numberOfTrainingSamples,])
+train_labels <- win[1:numberOfTrainingSamples]
+test_data <- as.matrix(opdata_matrix[-(1:numberOfTrainingSamples),])
+test_labels <- win[-(1:numberOfTrainingSamples)]
+#sets up testing and training matrices
+
+
+```
+
+
+
+```{r}
+dtrain <- xgb.DMatrix(data = train_data, label = train_labels)
+dtest <- xgb.DMatrix(data = test_data, label = test_labels)
+#creates specific data format 
+```
+
+
+```{r}
+
+model_tuned <- xgboost(data = dtrain,
+                       #data set
+                       booster = "gbtree",
+                       #type of "booster", doens't really make a difference
+                       eta  = .31, 
+                       #eta is the learning rate, lower is usually better but +requires more rounds to be accurate 
+                       verbose =0,
+                       #make it so it doesn't print the training round results, make equal 1 to see those
+                     
+                      max.depth =12,
+                      #the numer of trees deep the model will go
+                       nround = 50,
+                      #how many rounds of training, more is better but can lead to overfitting
+                      early_stopping_rounds = 10,
+                      #if the training result doesn't increase in 10 rounds, stop training
+                     
+                      objective = "binary:logistic"
+                      #looking for a binary result
+                      )
+
+                  
+predXGdeep <- predict(model_tuned, dtest)
+
+#uses model created to predict on test data, producing a number between 1 and 0 for each op
+err<- mean(as.numeric(predXGdeep>.5)!= test_labels)
+#finds the error by splitting the results at .5, the seeing when they match the actual results
+
+print(paste("test-error=", err))
+
+
+```
+
+```{r}
+
+params <- list(booster = "gbtree", objective = "binary:logistic", eta=0.4, verbose=0, max_depth=4)
+#set the params for the second model
+
+xgb1 <- xgb.train (params = params, data = dtrain, nrounds =50, watchlist = list(val=dtest,train=dtrain), early_stop.round = 10, verbose = 0)
+
+xgbpredshort <- predict (xgb1,dtest, na.action = na.pass)
+
+
+#same stuff as before, just different params
+
+err<- mean(as.numeric(xgbpredshort>.5)!= test_labels)
+print(paste("test-error=", err))
+mat <- xgb.importance (feature_names = colnames(train_data),model = xgb1)
+xgb.plot.importance (importance_matrix = mat[1:20]) 
+#can be used to find importance of variables
+```
+
+```{r}
+predRFtest <- as.numeric(predRFtest)/2
+predRFtest <- ifelse (predRFtest > 0.5 ,1,0)
+```
+
+
+```{r}
+
+# predXGdeep<- (as.numeric(predXGdeep>.5))
+# 
+# predXGdeep <- lapply(predXGdeep, as.numeric)
+ 
+
+
+pred7 <- ((predXGdeep*.45) + (xgbpredshort*.2) + (predRFtest*(.35)))
+
+err<- mean(as.numeric(pred7>.5)!= test_labels)
+
+print(paste("test-error=", err))
+
+#nice loop to figre out balence of results
+pred8 <- ifelse (pred7 > 0.5 ,1,0)
+pred8 <- factor(pred8)
+test_labels1<-factor(test_labels)
+str(pred8)
+str(test_labels1)
+confusionMatrix(pred8, test_labels1)
+#adds results of all three tests together and finds new errors.
+
+```
+
+
+```{r}
+incoming_test_data1 <- dbGetQuery(con,
+"select salesforce_opportunity_id, salesforce_opportunity_stage_name, salesforce_account_company_type, time_from_2017, salesforce_op_annual_construction_volume, salesforce_account_billing_latitude, salesforce_account_billing_longitude, salesforce_account_market_served_limited, salesforce_opportunity_zuora_amount,manager_of_opportunity_owner_id,  salesforce_account_id, task_count, salesforce_opportunity_competitor , filled_forms,moments, opened_emails,date_difference,trial,datahug
+
+from
+
+(
+
+WITH salesforce_user AS (select salesforce.user.*, salesforce.user_role.name as user_role
+
+        from  salesforce.user
+
+        left join salesforce.user_role
+
+        on salesforce.user.user_role_id =  salesforce.user_role.id )
+
+  ,  is_pipe_won_sql AS (SELECT bat_id as bizible_attribution_id,
+
+       TRUE AS is_pipe,
+
+      CASE WHEN stage_name = 'Closed Won' THEN TRUE
+
+           ELSE FALSE
+
+       END AS is_won from
+
+  (SELECT bat.id AS bat_id, opp.id AS opp_id, stage_name, bat.bizible_2_touchpoint_date_c,bat.bizible_2_touchpoint_position_c, row_number() over (partition BY opp.id
+
+                                                                                                                                                              ORDER BY bat.bizible_2_touchpoint_date_c) AS num
+
+   FROM salesforce._account acct
+
+   JOIN salesforce.bizible_2_bizible_attribution_touchpoint_c bat ON bizible_2_account_c = acct.id
+
+   JOIN salesforce.opportunity opp ON bat.bizible_2_opportunity_c = opp.id
+
+   WHERE opp.type IN ('New Annual Access', 'New Multi-Year Annual Access', 'Convert Pilot to Multi-Year Annual', 'Convert Pilot Project to Annual Access')
+
+     AND opp.stage_name IN ('2 - Discovery', '3 - Evaluation', '4 - Proposal/ROI', '5 - Negotiations', '6 - Final Contract Out For Signature', 'Deal Review', 'Closed Won', 'Closed Lost')
+
+   )
+
+WHERE num = 1
+
+ )
+
+  ,  bizible_attribution_touchpoint AS (select *
+
+    from salesforce.bizible_2_bizible_attribution_touchpoint_c bat
+
+    left join is_pipe_won_sql is_pipe_won
+
+    on bat.id = is_pipe_won.bizible_attribution_id
+
+    
+
+    )
+
+SELECT 
+
+    CASE
+
+WHEN salesforce_account.company_type_3_c='General Contractor'  THEN '0' 
+
+WHEN salesforce_account.company_type_3_c='Subcontractor'  THEN '1' 
+
+WHEN salesforce_account.company_type_3_c in ('Owner','Real Estate Developer')  THEN '2' 
+
+ELSE '3' 
+
+END AS salesforce_account_company_type__sort_,
+
+    salesforce_opportunity.id  AS salesforce_opportunity_id,
+
+    salesforce_opportunity.account_id  AS salesforce_opportunity_account_id,
+
+    salesforce_opportunity.stage_name  AS salesforce_opportunity_stage_name,
+
+    salesforce_opportunity.annual_construction_volume_cap_c  AS salesforce_op_annual_construction_volume,
+
+    salesforce_account.billing_latitude  AS salesforce_account_billing_latitude,
+
+    CASE
+
+WHEN salesforce_account.company_type_3_c='General Contractor'  THEN 'General Contractor' 
+
+WHEN salesforce_account.company_type_3_c='Subcontractor'  THEN 'Subcontractor' 
+
+WHEN salesforce_account.company_type_3_c in ('Owner','Real Estate Developer')  THEN 'Owner / Real Estate Developer' 
+
+ELSE 'Other' 
+
+END AS salesforce_account_company_type,
+
+    salesforce_account.billing_longitude  AS salesforce_account_billing_longitude,
+
+    CASE WHEN salesforce_account.market_served_3_c in ('Commercial and Institutional',
+
+                                        'Education',
+
+                                        'Healthcare',
+
+                                        'Retail')
+
+          THEN 'Commercial/Non-Residential'
+
+          WHEN salesforce_account.market_served_3_c in ('Multifamily',
+
+                                    'Single Family')
+
+          THEN 'Residential'
+
+          ELSE 'Infrastructure'
+
+          END
+
+           AS salesforce_account_market_served_limited,
+
+    DATE(case when (DATE(salesforce_opportunity.pipeline_creation_by_stage_c )) >= '2016-07-01' then (DATE(salesforce_opportunity.pipeline_creation_by_stage_c ))
+
+        when (salesforce_opportunity.stage_name in (
+
+          '2 - Discovery',
+
+          '3 - Evaluation',
+
+          '4 - Proposal/ROI',
+
+          '5 - Negotiations',
+
+          '6 - Final Contract Out For Signature',
+
+          'Deal Review',
+
+          'Closed Won',
+
+          'Closed Lost')
+
+          and (DATE(salesforce_opportunity.pipeline_creation_time_c )) is not null)
+
+          then cast((DATE(salesforce_opportunity.pipeline_creation_time_c )) as date) else (DATE(salesforce_opportunity.pipeline_creation_by_stage_c )) end) AS salesforce_opportunity_true_pipeline_creation_date,
+
+    salesforce_opportunity.zuora_amount_c  AS salesforce_opportunity_zuora_amount,
+
+    manager_of_opportunity_owner.id  AS manager_of_opportunity_owner_id,
+
+        
+
+            date(salesforce_opportunity_true_pipeline_creation_date) - date('2017-01-01') as time_from_2017,
+
+    salesforce_account.id  AS salesforce_account_id,
+
+    count(case when salesforce_task.type is not NULL and    DATE(salesforce_task.created_date ) < DATE(salesforce_opportunity.pipeline_creation_time_c ) then 1 else null end) over(partition by salesforce_opportunity_id)as task_count,
+
+    salesforce_opportunity.competitor_c  AS salesforce_opportunity_competitor,
+
+    sum( marketo_agg_by_date_lead_rollup_activites.distinct_fill_out_form)over(partition by salesforce_opportunity_id)  as filled_forms,
+
+    sum( marketo_agg_by_date_lead_rollup_activites.distinct_interesting_moment) over(partition by salesforce_opportunity_id)as moments,
+
+    sum( marketo_agg_by_date_lead_rollup_activites.distinct_open_email ) over(partition by salesforce_opportunity_id) as opened_emails, 
+
+    
+
+    DATE(salesforce_opportunity.pipeline_creation_time_c ) - DATE(salesforce_opportunity.created_date ) as date_difference,
+
+ 
+
+  salesforce_opportunity.demo_access_c as trial,
+
+  salesforce_opportunity.datahugapps_dhs_c as datahug,
+
+  salesforce_account.billing_country
+
+ 
+
+ 
+
+FROM salesforce.account  AS salesforce_account
+
+        
+
+LEFT JOIN salesforce.opportunity  AS salesforce_opportunity ON salesforce_opportunity.account_id = salesforce_account.id
+
+LEFT JOIN salesforce_user AS opportunity_owner ON salesforce_opportunity.owner_id = opportunity_owner.id 
+
+INNER JOIN salesforce_user AS manager_of_opportunity_owner ON manager_of_opportunity_owner.id = opportunity_owner.manager_id 
+
+Left Join salesforce.task as salesforce_task on salesforce_task.opportunity_c = salesforce_opportunity.id
+
+left join salesforce.contact as salesforce_contact on salesforce_contact.account_id = salesforce_account.id
+
+left join marketo.lead as marketo_lead on marketo_lead.sfdc_contact_id = salesforce_contact.id
+
+Left join marketo.agg_by_date_lead_rollup_activities as marketo_agg_by_date_lead_rollup_activites on  marketo_agg_by_date_lead_rollup_activites.lead_id = marketo_lead.id 
+
+INNER JOIN bizible_attribution_touchpoint AS bizible_attribution_touchpoints ON bizible_attribution_touchpoints.bizible_2_opportunity_c = salesforce_opportunity.id
+
+      and bizible_attribution_touchpoints.is_deleted = false
+
+WHERE 
+
+DATE(salesforce_opportunity.pipeline_creation_time_c ) > date(CURRENT_DATE) - 7 and 
+
+(salesforce_account.billing_country ilike 'United States') and
+
+ (date(salesforce_opportunity_true_pipeline_creation_date) > date(bizible_attribution_touchpoints.bizible_2_touchpoint_date_c)) and  date(marketo_agg_by_date_lead_rollup_activites.activity_date) < DATE(salesforce_opportunity.pipeline_creation_time_c  ) and salesforce_opportunity_competitor is not null and  (salesforce_opportunity.type ILIKE 'New Annual Access' OR salesforce_opportunity.type ILIKE 'New Multi-Year Annual Access') AND ((case when (DATE(salesforce_opportunity.pipeline_creation_by_stage_c )) >= '2016-07-01' then (DATE(salesforce_opportunity.pipeline_creation_by_stage_c ))
+
+        when (salesforce_opportunity.stage_name in (
+
+          '2 - Discovery',
+
+          '3 - Evaluation',
+
+          '4 - Proposal/ROI',
+
+          '5 - Negotiations',
+
+          '6 - Final Contract Out For Signature',
+
+          'Deal Review',
+
+          'Closed Won',
+
+          'Closed Lost')
+
+          and (DATE(salesforce_opportunity.pipeline_creation_time_c )) is not null)
+
+          then cast((DATE(salesforce_opportunity.pipeline_creation_time_c )) as date) else (DATE(salesforce_opportunity.pipeline_creation_by_stage_c )) end >= TIMESTAMP '2017-01-01')) AND (bizible_attribution_touchpoints.bizible_2_touchpoint_date_c  IS NOT NULL)  and  (salesforce_opportunity.is_deleted = false and salesforce_account.is_deleted = false)
+
+GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,salesforce_task.type,salesforce_account_id,salesforce_task.call_duration_in_seconds,salesforce_opportunity_competitor,marketo_agg_by_date_lead_rollup_activites.distinct_fill_out_form, marketo_agg_by_date_lead_rollup_activites.distinct_interesting_moment, marketo_agg_by_date_lead_rollup_activites.distinct_open_email, marketo_agg_by_date_lead_rollup_activites.distinct_visit_webpage,salesforce_opportunity.pipeline_creation_time_c, salesforce_opportunity.created_date,trial,salesforce_task.created_date,marketo_agg_by_date_lead_rollup_activites.activity_date,datahug,salesforce_account.billing_country
+
+)
+
+group by salesforce_opportunity_id, salesforce_opportunity_stage_name, salesforce_account_company_type, time_from_2017, salesforce_op_annual_construction_volume, salesforce_op_annual_construction_volume, salesforce_account_billing_longitude, salesforce_account_billing_latitude, salesforce_account_market_served_limited,salesforce_opportunity_zuora_amount,manager_of_opportunity_owner_id ,  salesforce_account_id, task_count,salesforce_opportunity_competitor, filled_forms,moments, opened_emails,date_difference,trial,datahug
+
+"
+)
+
+```
+
+
+```{r}
+
+incoming_test_data<- incoming_test_data1
+
+
+incoming_test_data<- incoming_test_data%>%
+  select (-(salesforce_account_id))
+incoming_test_data<- incoming_test_data%>%
+  select (-(salesforce_opportunity_id))
+#Pulls in data and removes op and account id fields
+
+```
+
+
+
+
+```{r}
+
+
+colnumb <- which( colnames(incoming_test_data)=="salesforce_account_market_served_limited" )
+
+incoming_test_data  <- incoming_test_data %>%
+  mutate_all(funs(str_replace_all( . , "/", "")))
+incoming_test_data  <- incoming_test_data %>%
+  mutate_all(funs(str_replace_all( . , " ", "")))
+incoming_test_data  <- incoming_test_data %>%
+  mutate_all(funs(str_replace_all( . , "-", "")))
+#removes unusual characters from fields
+
+
+trial <- incoming_test_data %>%
+  select(trial) %>%
+  magrittr::equals("Completed")
+incoming_test_data$time_from_2017 <- as.numeric(incoming_test_data$time_from_2017)
+trial <-lapply(trial, is.na)
+trial <- lapply(trial, as.numeric)
+trial <- as.numeric(trial)
+#Changes trial field from Completed and Null to 1 and 0
+```
+
+
+
+```{r}
+
+incoming_test_data <- incoming_test_data %>%
+  select (-(trial))
+#removes old trial field with strings
+
+
+```
+
+
+
+
+
+
+
+```{r}
+
+incoming_test_data <- cbind(incoming_test_data,trial)
+#adds new trial column to data frame and removes null data frame testing
+
+win<- rep(0,length(incoming_test_data$time_from_2017))
+win[1]<-1
+#sets dummy wins, need but not used in random forest
+win <-as.numeric(win)
+incoming_test_data<- incoming_test_data %>%
+  select (-(salesforce_opportunity_stage_name))
+
+#Removes old Closed Won and Closed Lost Field
+test_data_frame1 <- cbind(incoming_test_data,win)
+#adds wins
+```
+
+
+
+
+
+```{r}
+
+
+test_data_frame1$date_difference <- as.double(test_data_frame1$date_difference)
+test_data_frame1$task_count <- as.numeric(test_data_frame1$task_count)
+test_data_frame1$filled_forms <- as.double(test_data_frame1$filled_forms)
+test_data_frame1$moments <- as.double(test_data_frame1$moments)
+test_data_frame1$opened_emails <- as.double(test_data_frame1$opened_emails)
+test_data_frame1$salesforce_opportunity_zuora_amount <- as.double(test_data_frame1$salesforce_opportunity_zuora_amount)
+test_data_frame1$salesforce_account_billing_longitude <- as.double(test_data_frame1$salesforce_account_billing_longitude)
+test_data_frame1$salesforce_account_billing_latitude <- as.double(test_data_frame1$salesforce_account_billing_latitude)
+test_data_frame1$salesforce_op_annual_construction_volume <- as.double(test_data_frame1$salesforce_op_annual_construction_volume)
+test_data_frame1 <- test_data_frame1 %>%
+  select (-(manager_of_opportunity_owner_id))
+test_data_frame1 <- test_data_frame1 %>%
+  select (-(salesforce_opportunity_competitor))
+
+
+test_data_frame1$win <- as.factor(test_data_frame1$win)
+test_data_frame1=test_data_frame1 %>% mutate_if(is.character, as.factor)
+test_data_frame1<-test_data_frame1[,sort(names(test_data_frame1))]
+levels(test_data_frame1$salesforce_account_company_type)<- levels(test_data_frame$salesforce_account_company_type)
+levels(test_data_frame1$salesforce_account_market_served_limited)<- levels(test_data_frame$salesforce_account_market_served_limited)
+predRFtest_outgoing <- predict(model_rf, test_data_frame1)
+
+```
+
+
+```{r}
+
+incoming_test_data <-incoming_test_data1
+incoming_test_data <- incoming_test_data%>%
+  select (-(salesforce_account_id))
+incoming_test_data <- incoming_test_data%>%
+  select (-(salesforce_opportunity_id))
+#brings in uncleaned data again to be used on the other two models
+```
+
+
+
+
+```{r}
+
+
+
+
+colnumb <- which( colnames(incoming_test_data)=="salesforce_account_market_served_limited" )
+
+incoming_test_data  <- incoming_test_data %>%
+  mutate_all(funs(str_replace_all( . , "/", "")))
+incoming_test_data  <- incoming_test_data %>%
+  mutate_all(funs(str_replace_all( . , " ", "")))
+incoming_test_data  <- incoming_test_data %>%
+  mutate_all(funs(str_replace_all( . , "-", "")))
+#Cleans up bad characters
+competitor <- model.matrix(~salesforce_opportunity_competitor-1, incoming_test_data)
+owner_id <- model.matrix(~manager_of_opportunity_owner_id-1, incoming_test_data)
+company_type <- model.matrix(~salesforce_account_company_type-1, incoming_test_data)
+market <- model.matrix(~salesforce_account_market_served_limited-1, incoming_test_data)
+#As XGBoost only accepts doubles, char columns are made into matrices where each option is a column with either a 1 or a 0
+trial <- incoming_test_data %>%
+  select(trial) %>%
+  magrittr::equals("Completed")
+#Makes the trial field binary
+incoming_test_data$time_from_2017 <- as.numeric(incoming_test_data$time_from_2017)
+trial <-lapply(trial, is.na)
+trial <- lapply(trial, as.numeric)
+trial <- as.numeric(trial)
+```
+
+
+
+```{r}
+incoming_test_data <- incoming_test_data %>%
+  select(-(salesforce_opportunity_competitor))
+incoming_test_data <- incoming_test_data %>%
+  select (-(trial))
+incoming_test_data <- incoming_test_data %>%
+  select(-(manager_of_opportunity_owner_id))
+incoming_test_data <- incoming_test_data %>%
+  select (-(salesforce_account_company_type))
+incoming_test_data <- incoming_test_data %>%
+  select (-(salesforce_account_market_served_limited))
+#removes old fields
+
+```
+
+
+
+
+
+
+
+```{r}
+incoming_test_data_numeric <- cbind(incoming_test_data,trial,competitor, market, owner_id, company_type)
+
+
+
+incoming_test_data_numeric<- incoming_test_data_numeric %>%
+  select (-(salesforce_opportunity_stage_name))
+
+
+
+#sticks all the new fields together
+
+
+```
+
+
+
+```{r}
+
+in_names <- colnames(incoming_test_data_numeric)
+old_names <- colnames(train_data)
+dif_names<- setdiff(old_names, in_names)
+p<-1
+op_count_new <- length(incoming_test_data_numeric$time_from_2017)
+q<- rep(0, op_count_new)
+name_frame <- touch_frame <- data_frame(q)
+
+while (p<= (length(dif_names))){
+  name_frame[p]<-rep(0, op_count_new)
+  p<-p+1
+}
+colnames(name_frame) <- dif_names
+incoming_test_data_numeric <- cbind(incoming_test_data_numeric, name_frame)
+leftovers<-setdiff(colnames(incoming_test_data_numeric), colnames(opdata_numeric))
+leftovers <- na.omit(leftovers)
+
+p<- 1
+if(length(leftovers) >= 1){
+  while (p <= length(leftovers)){
+    r<- leftovers[p]
+    incoming_test_data_numeric<- incoming_test_data_numeric %>%
+      select (-(r))
+    p <- p+1
+  }
+}
+labels_false <- rep(0, length(incoming_test_data_numeric$time_from_2017))
+labels_false <- as.numeric(labels_false)
+
+#For xgboost to work, all the column names need to be in the same order and all need to be present. Since many column names are based on character entries made into matrices, some are not present in smaller data sets, so all this crap is needed
+```
+
+```{r}
+dincoming2<-incoming_test_data_numeric[,sort(names(incoming_test_data_numeric))]
+incoming_test_data_matrix <- data.matrix(dincoming2)
+
+
+incoming_test_data_matrix <- as.matrix(incoming_test_data_matrix)
+
+#orders and makes into matrix
+
+```
+
+
+
+```{r}
+dincoming <- xgb.DMatrix(data = incoming_test_data_matrix, label = labels_false)
+#creates specific data format 
+predXGdeep_outgoing <- predict(model_tuned,dincoming)
+predXGshort_outgoing <- predict(xgb1,dincoming)
+#makes predicions using both models
+```
+
+```{r}
+predRFtest_outgoing <- as.numeric(predRFtest_outgoing)/2
+predRFtest_outgoing <- ifelse (predRFtest_outgoing > 0.5 ,1,0)
+#the random forest results came out as 1 and 2 instead of 0 and 1, so this fixes that
+```
+
+
+```{r}
+results_numeric <- rep(0, length(predXGshort_outgoing))
+
+i<-1
+while(i<=length(predXGshort_outgoing)){
+  if(is.na(predRFtest_outgoing[i])  == TRUE){
+    results_numeric[i] <- (.5*predXGdeep_outgoing[i]) + (.5*predXGshort_outgoing[i])
+  }
+  else{
+    results_numeric[i] <- (.3*predXGdeep_outgoing[i]) + (.3*predXGshort_outgoing[i]) + (.4*predRFtest_outgoing[i])
+    
+  }
+  i<-i+1
+}
+#since RF doesn't deal with NA's, if a value is missing, the prediction can only rely on the XGBoost models. Weight that data as was found best in training
+results_binary <- ifelse (results_numeric > 0.5 ,1,0)
+#makes results binary
+
+```
+
+```{r}
+title <- paste(Sys.Date(), "Prediction and Data", sep = " ")
+final_frame <- cbind(incoming_test_data1,results_binary,results_numeric)
+#creates nice frame with all the info to be saved
+```
+
+
+```{r}
+write.table(final_frame, title, sep = "\t")
+#exports table titled as todays date + Prediction and Data and can be found in documents
+```
+
